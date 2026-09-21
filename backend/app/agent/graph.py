@@ -93,6 +93,22 @@ def run_one_tool(state: AgentState) -> dict:
     triggering_message, tc = _next_unanswered_tool_call(state)
     assert tc is not None, "run_one_tool entered with nothing to do - routing bug"
 
+    if tc["name"] == "ask_question":
+        # A different reason to interrupt() than APPROVAL_REQUIRED_TOOLS
+        # below - not "may I run this," but "what should I do." The resume
+        # value is the option text the user picked, not approve/deny, and
+        # it becomes the tool's result directly - there's no real tool
+        # execution here, `execute_tool` never sees this tool name.
+        answer = interrupt(
+            {
+                "kind": "clarification",
+                "tool_call_id": tc["id"],
+                "question": tc["args"]["question"],
+                "options": tc["args"]["options"],
+            }
+        )
+        return {"messages": [ToolMessage(content=answer, tool_call_id=tc["id"])]}
+
     mode = state["mode"]
     workdir = Path(state["workdir"])
     # Exclude the AIMessage that requested this call from the dedup check -
@@ -105,7 +121,7 @@ def run_one_tool(state: AgentState) -> dict:
         # persists everything and the graph stops here until a
         # Command(resume=...) arrives. On resume, this node re-runs from the
         # top - nothing above this line has a side effect, so that's safe.
-        decision = interrupt({"tool_call_id": tc["id"], "name": tc["name"], "input": tc["args"]})
+        decision = interrupt({"kind": "approval", "tool_call_id": tc["id"], "name": tc["name"], "input": tc["args"]})
         if decision == "deny":
             writer({"type": "tool_denied", "tool_call_id": tc["id"]})
             return {

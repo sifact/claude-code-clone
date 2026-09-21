@@ -4,16 +4,17 @@ A from-scratch reimplementation of [nightcode](../nightcode)'s AI agent loop, us
 FastAPI + React/Ink instead of Hono + AI SDK.
 
 **This branch (`feature/langgraph`) is step 2 of the learning plan**: the
-same agent loop, same tools, same FastAPI endpoints, same frontends -
-rebuilt on LangGraph instead of hand-written. `main` and the earlier
-`feature/*` branches have the hand-rolled version (`agent/loop.py`, a plain
-`for` loop with no framework); this branch replaces `agent/` internals with
-a `StateGraph` while keeping everything *outside* `agent/` - `tools/`,
-`system_prompt.py`, both frontends - completely unchanged. That's what makes
-it a fair comparison rather than a rewrite: same behavior, verified live
-here the same way it was on the hand-rolled branches, different mechanism
-underneath. See "Hand-rolled vs LangGraph" below for what that swap actually
-bought.
+same agent loop rebuilt on LangGraph instead of hand-written. `main` and the
+earlier `feature/*` branches have the hand-rolled version (`agent/loop.py`,
+a plain `for` loop with no framework); this branch replaces `agent/`
+internals with a `StateGraph`. `tools/`, `system_prompt.py`, and the browser
+client are untouched; the CLI gained one new feature this branch's mechanism
+made easy to add (clarification questions, arrow-key answered - see below),
+which is the only reason it isn't identical too. That's what makes the core
+comparison a fair one rather than a rewrite: same loop behavior, verified
+live here the same way it was on the hand-rolled branches, different
+mechanism underneath. See "Hand-rolled vs LangGraph" below for what that
+swap actually bought.
 
 Billing, auth, and persistence are intentionally left out (sessions are an
 in-memory dict - or, on this branch, an in-memory checkpointer, same idea).
@@ -144,9 +145,14 @@ backend/    FastAPI. POST /chat streams Server-Sent Events.
       approval.py         which tools pause for a human decision (CLI only,
                            unchanged - framework-agnostic either way)
     tools/              tool schemas + sandboxed execution (server-side) -
-                         entirely unchanged from the hand-rolled branches
-      schemas.py          the 7 tool definitions the model sees
-      dispatch.py         routes a tool call by name to its handler
+                         same as the hand-rolled branches, except one
+                         addition below
+      schemas.py          the 8 tool definitions the model sees - 7 unchanged,
+                           plus `ask_question` (added on this branch: see
+                           "Clarification questions" below)
+      dispatch.py         routes a tool call by name to its handler -
+                           `ask_question` never reaches this; agent/graph.py
+                           intercepts it before dispatch
       filesystem.py       read_file/list_directory/glob/grep/write_file/edit_file
       shell.py            bash
       sandbox.py          shared path/size-limit helpers, ToolError
@@ -161,9 +167,11 @@ frontend/   React + Vite, styled as a terminal (dark, monospace, prompt-style
 cli/        A real terminal client via Ink (React renderer for terminals,
             same idea as nightcode's own OpenTUI) instead of a browser.
   src/
-    lib/agent-client.ts  same SSE client as the browser's, plus `cwd`
-    App.tsx              Ink UI: Box/Text instead of div/CSS, Tab to
-                          toggle mode instead of a clickable button
+    lib/agent-client.ts  same SSE client as the browser's, plus `cwd` and
+                          `/chat/respond` for resuming a paused turn
+    App.tsx              Ink UI: Box/Text instead of div/CSS, Tab to toggle
+                          mode, ink-select-input for clarification answers
+                          (arrow keys + enter) instead of a clickable button
 ```
 
 Each backend file is small enough to read start to finish in one sitting.
@@ -201,6 +209,30 @@ pausing again on a second approval-required call reached in that
 continuation, and the model persistently trying an *alternative* tool after
 one denial, correctly caught by the same gate again); deny skips execution
 and the model adapts, same as the hand-rolled version.
+
+**Clarification questions (CLI only) — the same `interrupt()`, a different
+reason to use it.** `ask_question` (`tools/schemas.py`) isn't a real tool in
+the filesystem/shell sense - it's available in *both* PLAN and BUILD mode,
+and `run_one_tool` special-cases it before any of the approval/dedup/execute
+logic even runs. When the model calls it, `interrupt({"kind":
+"clarification", "question": ..., "options": [...]})` pauses the graph the
+same way an approval does, but the resume value isn't approve/deny - it's
+the exact option text the user picked, which becomes that tool call's
+result directly. `main.py` tells the two kinds of pause apart by the
+`"kind"` field on the interrupt's value and emits a distinct SSE event
+(`clarification_required` vs `approval_required`); `/chat/respond`'s
+request body was generalized from `decision: "approve"|"deny"` to a plain
+`value: str` to carry either one, since the frontend always knows which
+kind it's answering from the event it received. In the CLI, this renders as
+an `ink-select-input` list - arrow keys to move, enter to pick - replacing
+the normal input row while it's showing, the same way the approval prompt
+does. Verified live: the model asking a real clarifying question with
+sensible options, the answer correctly becoming that tool's result and the
+model referencing it in its next response, `ask_question` working
+identically in PLAN mode (it's read-only in spirit even though it's not in
+`tools/dispatch.py` at all), and the `409` guard correctly blocking a new
+message while a clarification is still pending - same as it already did for
+approvals.
 
 ## Running it
 
@@ -264,6 +296,20 @@ because it ran too late relative to when the triggering message got
 appended) showed up in *both* implementations, independently, at the same
 point. Same root cause, different framework - the mechanics don't get
 safer just because a framework is doing more of the surrounding work.
+
+**What's genuinely new, not just easier**: clarification questions
+(`ask_question`). This isn't in the hand-rolled version at all - it wasn't
+just harder to build there, it wasn't attempted, because the whole
+`PENDING_APPROVALS`/manual-resume apparatus was already bespoke enough for
+one purpose (approve/deny). Once `interrupt()` existed as a general "pause
+for any reason, resume with any value" primitive, adding a second, unrelated
+use for it (a multiple-choice question instead of a yes/no) was a small,
+contained change: one more tool definition, one more branch in
+`run_one_tool`, one more case in the SSE translation. That's the real
+argument for the framework - not that any single feature became impossible
+to build by hand, but that the *second* feature built on the same mechanism
+got cheap once the mechanism existed as a reusable primitive instead of a
+one-off.
 
 ## Next steps (per the learning plan)
 

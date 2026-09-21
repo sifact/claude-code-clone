@@ -4,7 +4,9 @@
 // frontend/src/lib/agent-client.ts (Node's native fetch implements the same
 // WHATWG ReadableStream interface a browser does). Real differences: this
 // sends `cwd` (a browser has no real filesystem to sandbox tools to), and
-// it has a second endpoint for resuming a turn paused on human approval.
+// it has a second endpoint for resuming a turn paused on a human decision -
+// either an approve/deny, or an answer to a clarifying question the model
+// asked (agent/graph.py's `ask_question`).
 
 export type AgentEvent =
   | { type: "text_delta"; text: string }
@@ -14,6 +16,7 @@ export type AgentEvent =
   | { type: "tool_skipped"; tool_call_id: string; name: string }
   | { type: "approval_required"; tool_call_id: string; name: string; input: unknown }
   | { type: "tool_denied"; tool_call_id: string }
+  | { type: "clarification_required"; tool_call_id: string; question: string; options: string[] }
   | { type: "done"; stop_reason: string }
   | { type: "error"; message: string }
   | { type: "retry"; attempt: number; reason: string };
@@ -62,14 +65,17 @@ export async function streamChat(
   await readEventStream(response, onEvent);
 }
 
-export async function respondToApproval(
-  params: { sessionId: string; decision: "approve" | "deny" },
+// `value` is "approve"/"deny" for a tool-approval pause, or the exact
+// option text picked for a clarification-question pause - the caller
+// already knows which kind it's resolving from the event it received.
+export async function resumeTurn(
+  params: { sessionId: string; value: string },
   onEvent: (event: AgentEvent) => void,
 ) {
   const response = await fetch(`${API_URL}/chat/respond`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: params.sessionId, decision: params.decision }),
+    body: JSON.stringify({ session_id: params.sessionId, value: params.value }),
   });
   await readEventStream(response, onEvent);
 }

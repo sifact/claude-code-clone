@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import { useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
-import { respondToApproval, streamChat, type AgentEvent } from "./lib/agent-client.js";
+import SelectInput from "ink-select-input";
+import { resumeTurn, streamChat, type AgentEvent } from "./lib/agent-client.js";
 
 type Mode = "PLAN" | "BUILD";
 
 type PendingApproval = { toolCallId: string; name: string; input: unknown };
+type PendingClarification = { toolCallId: string; question: string; options: string[] };
 
 type LogEntry =
   | { kind: "user"; id: string; text: string }
@@ -16,6 +18,8 @@ type LogEntry =
   | { kind: "tool_error"; id: string; error: string }
   | { kind: "tool_skipped"; id: string; name: string }
   | { kind: "tool_denied"; id: string }
+  | { kind: "clarification"; id: string; question: string }
+  | { kind: "clarification_answered"; id: string; answer: string }
   | { kind: "system"; id: string; text: string };
 
 const SESSION_ID = randomUUID();
@@ -38,6 +42,7 @@ export default function App() {
   const [mode, setMode] = useState<Mode>("BUILD");
   const [busy, setBusy] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  const [pendingClarification, setPendingClarification] = useState<PendingClarification | null>(null);
   const streamingIdRef = useRef<string | null>(null);
 
   function appendLog(entry: LogEntry) {
@@ -96,6 +101,13 @@ export default function App() {
       return;
     }
 
+    if (event.type === "clarification_required") {
+      streamingIdRef.current = null;
+      appendLog({ kind: "clarification", id: event.tool_call_id, question: event.question });
+      setPendingClarification({ toolCallId: event.tool_call_id, question: event.question, options: event.options });
+      return;
+    }
+
     if (event.type === "done") {
       streamingIdRef.current = null;
       setLog((prev) =>
@@ -124,7 +136,7 @@ export default function App() {
 
   async function handleSubmit(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || busy || pendingApproval) return;
+    if (!trimmed || busy || pendingApproval || pendingClarification) return;
 
     appendLog({ kind: "user", id: randomUUID(), text: trimmed });
     setInput("");
@@ -144,15 +156,14 @@ export default function App() {
     }
   }
 
-  async function resolveApproval(decision: "approve" | "deny") {
-    if (!pendingApproval) return;
-
+  async function resume(value: string) {
     setPendingApproval(null);
+    setPendingClarification(null);
     setBusy(true);
     streamingIdRef.current = null;
 
     try {
-      await respondToApproval({ sessionId: SESSION_ID, decision }, handleEvent);
+      await resumeTurn({ sessionId: SESSION_ID, value }, handleEvent);
     } catch (error) {
       appendLog({
         kind: "system",
@@ -164,13 +175,27 @@ export default function App() {
     }
   }
 
+  function resolveApproval(decision: "approve" | "deny") {
+    if (!pendingApproval) return;
+    void resume(decision);
+  }
+
+  function resolveClarification(answer: string) {
+    if (!pendingClarification) return;
+    appendLog({ kind: "clarification_answered", id: `${pendingClarification.toolCallId}-answer`, answer });
+    void resume(answer);
+  }
+
   // No mouse in a terminal: the mode toggle (a clickable button in the
-  // browser) is a keybinding, and so is the approve/deny prompt.
+  // browser) is a keybinding, and so is the approve/deny prompt. The
+  // clarification prompt's arrow-key navigation is handled by SelectInput
+  // itself below, not here - this only needs to stay out of its way.
   useInput((rawInput, key) => {
+    if (pendingClarification) return;
     if (pendingApproval) {
       const answer = rawInput.toLowerCase();
-      if (answer === "y" || key.return) void resolveApproval("approve");
-      else if (answer === "n" || key.escape) void resolveApproval("deny");
+      if (answer === "y" || key.return) resolveApproval("approve");
+      else if (answer === "n" || key.escape) resolveApproval("deny");
       return;
     }
     if (key.tab && !busy) {
@@ -191,10 +216,22 @@ export default function App() {
         {log.map((entry) => (
           <LogLine key={entry.id} entry={entry} />
         ))}
-        {busy && !streamingIdRef.current && !pendingApproval && <Text dimColor>…thinking</Text>}
+        {busy && !streamingIdRef.current && !pendingApproval && !pendingClarification && (
+          <Text dimColor>…thinking</Text>
+        )}
       </Box>
 
-      {pendingApproval ? (
+      {pendingClarification ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="magenta" bold>
+            ? {pendingClarification.question}
+          </Text>
+          <SelectInput
+            items={pendingClarification.options.map((option) => ({ label: option, value: option }))}
+            onSelect={(item) => resolveClarification(item.value)}
+          />
+        </Box>
+      ) : pendingApproval ? (
         <Box marginTop={1} flexDirection="column">
           <Text color="yellow" bold>
             ⚠ approve {pendingApproval.name} {formatToolInput(pendingApproval.input)}?
@@ -252,6 +289,14 @@ function LogLine({ entry }: { entry: LogEntry }) {
       return <Text dimColor>↻ skipped repeated {entry.name} call (already have this result)</Text>;
     case "tool_denied":
       return <Text color="red">✕ denied — not executed</Text>;
+    case "clarification":
+      return <Text color="magenta">? {entry.question}</Text>;
+    case "clarification_answered":
+      return (
+        <Text>
+          <Text color="magenta">↳</Text> {entry.answer}
+        </Text>
+      );
     case "system":
       return (
         <Text dimColor italic>

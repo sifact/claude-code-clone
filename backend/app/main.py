@@ -1,5 +1,8 @@
 """FastAPI entrypoint. Two endpoints: POST /chat starts a turn, POST
-/chat/respond continues one paused on a human approval decision.
+/chat/respond continues one paused for a human decision - either an
+approve/deny on a risky tool, or an answer to a multiple-choice question
+the model asked (agent/graph.py's `ask_question`). Both pause the graph the
+same way (`interrupt()`); only the payload shape and the resume value differ.
 
 No SESSIONS or PENDING_APPROVALS dict here, unlike the hand-rolled version -
 the LangGraph checkpointer owns all of that now, keyed by `session_id` as
@@ -9,7 +12,7 @@ its `thread_id`. That's the whole comparison this branch exists to show.
 import json
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -48,7 +51,11 @@ class ChatRequest(BaseModel):
 
 class RespondRequest(BaseModel):
     session_id: str
-    decision: Literal["approve", "deny"]
+    # "approve"/"deny" for a tool-approval pause, or the exact option text
+    # the user picked for a clarification-question pause - the frontend
+    # already knows which kind it's answering from the event it received,
+    # so this is deliberately just a generic resume value either way.
+    value: str
 
 
 def resolve_workdir(cwd: str | None) -> Path:
@@ -61,9 +68,10 @@ def resolve_workdir(cwd: str | None) -> Path:
     return workdir
 
 
-def has_pending_approval(config: dict[str, Any]) -> bool:
+def has_pending_interrupt(config: dict[str, Any]) -> bool:
     # A non-empty `.next` means the graph stopped mid-run - the only way
-    # that happens here is an unresolved interrupt() in run_one_tool.
+    # that happens here is an unresolved interrupt() in run_one_tool,
+    # whichever kind it is.
     return bool(agent_graph.get_state(config).next)
 
 
@@ -71,12 +79,13 @@ def sse_events(step_input: Any, config: dict[str, Any]) -> Generator[str, None, 
     """Drives the graph and formats its "custom" events (our own event
     vocabulary, emitted via get_stream_writer() in graph.py) as SSE lines.
     Interrupts don't come through that channel - they're a distinct
-    LangGraph control-flow signal - so they're translated here instead.
+    LangGraph control-flow signal - so they're translated here instead,
+    keyed off the "kind" each interrupt() call in graph.py tags itself with.
 
     Both frontends expect a final `done` event to clear their streaming
     cursor - the graph itself doesn't emit one (it just stops), so this
-    adds it explicitly, except when the turn paused on an approval instead
-    (that already clears the cursor client-side on `approval_required`).
+    adds it explicitly, except when the turn paused for a decision instead
+    (that already clears the cursor client-side on the pause event).
     """
     interrupted = False
     try:
@@ -87,8 +96,22 @@ def sse_events(step_input: Any, config: dict[str, Any]) -> Generator[str, None, 
                 yield f"data: {json.dumps(chunk)}\n\n"
             elif mode == "updates" and "__interrupt__" in chunk:
                 interrupted = True
-                approval = {"type": "approval_required", **chunk["__interrupt__"][0].value}
-                yield f"data: {json.dumps(approval)}\n\n"
+                value = chunk["__interrupt__"][0].value
+                if value["kind"] == "clarification":
+                    event = {
+                        "type": "clarification_required",
+                        "tool_call_id": value["tool_call_id"],
+                        "question": value["question"],
+                        "options": value["options"],
+                    }
+                else:
+                    event = {
+                        "type": "approval_required",
+                        "tool_call_id": value["tool_call_id"],
+                        "name": value["name"],
+                        "input": value["input"],
+                    }
+                yield f"data: {json.dumps(event)}\n\n"
         if not interrupted:
             yield f"data: {json.dumps({'type': 'done', 'stop_reason': 'stop'})}\n\n"
     except GraphRecursionError:
@@ -105,8 +128,8 @@ def sse_events(step_input: Any, config: dict[str, Any]) -> Generator[str, None, 
 @app.post("/chat")
 def chat(req: ChatRequest):
     config = {"configurable": {"thread_id": req.session_id}}
-    if has_pending_approval(config):
-        raise HTTPException(409, "Resolve the pending tool approval (/chat/respond) before sending a new message")
+    if has_pending_interrupt(config):
+        raise HTTPException(409, "Resolve the pending question/approval (/chat/respond) before sending a new message")
 
     workdir = resolve_workdir(req.cwd)
     step_input = initial_input(req.message, req.mode, workdir)
@@ -117,10 +140,10 @@ def chat(req: ChatRequest):
 @app.post("/chat/respond")
 def respond(req: RespondRequest):
     config = {"configurable": {"thread_id": req.session_id}}
-    if not has_pending_approval(config):
-        raise HTTPException(404, "No pending approval for this session")
+    if not has_pending_interrupt(config):
+        raise HTTPException(404, "No pending question/approval for this session")
 
-    return StreamingResponse(sse_events(Command(resume=req.decision), config), media_type="text/event-stream")
+    return StreamingResponse(sse_events(Command(resume=req.value), config), media_type="text/event-stream")
 
 
 def _serialize_message(message: BaseMessage) -> dict[str, Any]:

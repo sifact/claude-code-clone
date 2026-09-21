@@ -48,6 +48,27 @@ READ_ONLY_TOOLS: list[dict[str, Any]] = [
             "required": ["pattern"],
         },
     },
+    {
+        "name": "ask_question",
+        "description": (
+            "Ask the user a single multiple-choice clarifying question when their request is "
+            "ambiguous, underspecified, or needs a decision only they can make. Pauses until they "
+            "pick an answer. Not for yes/no confirmation before a risky action - that's automatic. "
+            "Use this when you genuinely can't proceed without knowing their preference."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to ask"},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "2-5 concise, mutually exclusive answer choices",
+                },
+            },
+            "required": ["question", "options"],
+        },
+    },
 ]
 
 BUILD_ONLY_TOOLS: list[dict[str, Any]] = [
