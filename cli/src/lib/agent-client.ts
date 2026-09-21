@@ -1,10 +1,10 @@
-// Talks to the FastAPI /chat SSE endpoint. Hand-rolled: fetch + a
+// Talks to the FastAPI SSE endpoints. Hand-rolled: fetch + a
 // ReadableStream reader, no EventSource (it can't send POST bodies) and no
 // SDK wrapping the protocol - nearly identical to the browser client in
 // frontend/src/lib/agent-client.ts (Node's native fetch implements the same
-// WHATWG ReadableStream interface a browser does). The one real difference:
-// this sends `cwd`, since unlike a browser, this process has an actual
-// filesystem location the backend can sandbox tool calls to.
+// WHATWG ReadableStream interface a browser does). Real differences: this
+// sends `cwd` (a browser has no real filesystem to sandbox tools to), and
+// it has a second endpoint for resuming a turn paused on human approval.
 
 export type AgentEvent =
   | { type: "text_delta"; text: string }
@@ -12,29 +12,17 @@ export type AgentEvent =
   | { type: "tool_result"; tool_call_id: string; output: unknown }
   | { type: "tool_error"; tool_call_id: string; error: string }
   | { type: "tool_skipped"; tool_call_id: string; name: string }
+  | { type: "approval_required"; tool_call_id: string; name: string; input: unknown }
+  | { type: "tool_denied"; tool_call_id: string }
   | { type: "done"; stop_reason: string }
   | { type: "error"; message: string }
   | { type: "retry"; attempt: number; reason: string };
 
 const API_URL = "http://localhost:8000";
 
-export async function streamChat(
-  params: { sessionId: string; message: string; mode: "PLAN" | "BUILD"; cwd: string },
-  onEvent: (event: AgentEvent) => void,
-) {
-  const response = await fetch(`${API_URL}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id: params.sessionId,
-      message: params.message,
-      mode: params.mode,
-      cwd: params.cwd,
-    }),
-  });
-
+async function readEventStream(response: Response, onEvent: (event: AgentEvent) => void) {
   if (!response.ok || !response.body) {
-    throw new Error(`Chat request failed: ${response.status}`);
+    throw new Error(`Request failed: ${response.status}`);
   }
 
   const reader = response.body.getReader();
@@ -55,4 +43,33 @@ export async function streamChat(
       onEvent(JSON.parse(line.slice(5).trim()) as AgentEvent);
     }
   }
+}
+
+export async function streamChat(
+  params: { sessionId: string; message: string; mode: "PLAN" | "BUILD"; cwd: string },
+  onEvent: (event: AgentEvent) => void,
+) {
+  const response = await fetch(`${API_URL}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id: params.sessionId,
+      message: params.message,
+      mode: params.mode,
+      cwd: params.cwd,
+    }),
+  });
+  await readEventStream(response, onEvent);
+}
+
+export async function respondToApproval(
+  params: { sessionId: string; decision: "approve" | "deny" },
+  onEvent: (event: AgentEvent) => void,
+) {
+  const response = await fetch(`${API_URL}/chat/respond`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: params.sessionId, decision: params.decision }),
+  });
+  await readEventStream(response, onEvent);
 }

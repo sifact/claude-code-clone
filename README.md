@@ -109,6 +109,7 @@ backend/    FastAPI. POST /chat streams Server-Sent Events.
       loop.py             run_agent_loop: ask model, run tools, repeat
       provider.py         model client config (base_url, model, timeout)
       dedup.py            skips a repeated read-only tool call
+      approval.py         which tools pause for a human decision (CLI only)
     tools/              tool schemas + sandboxed execution (server-side)
       schemas.py          the 7 tool definitions the model sees
       dispatch.py         routes a tool call by name to its handler
@@ -145,10 +146,29 @@ its own `process.cwd()` — so it operates on whatever real project you
 launched it from, the same experience as nightcode's actual CLI, even though
 the *mechanism* differs (nightcode's CLI executes tools locally because it
 has direct filesystem access; here the server still executes them, now just
-pointed at your real directory instead of a fixed one). Worth knowing: this
-means `bash` can run real commands on your actual machine, with **no
-approval gate** before it does — a deliberate scope decision, not an
-oversight, and worth adding if this project outgrows "just for learning."
+pointed at your real directory instead of a fixed one). `bash` can run real
+commands on your actual machine, which is why `write_file`/`edit_file`/`bash`
+(`agent/approval.py`) now pause for a human decision before running — see
+below.
+
+**Human-in-the-loop approval (CLI only).** When the model calls one of the
+three tools above, `agent/loop.py`'s `run_tool_calls` stops *before* running
+it and yields `approval_required` instead — the turn ends there. An SSE
+response can't sit open waiting for a keypress indefinitely, so the
+unresolved tool calls get saved server-side (`PENDING_APPROVALS` in
+`main.py`) and a separate `POST /chat/respond` endpoint applies the decision
+and resumes the loop from exactly that point - same step budget, no
+duplicated model calls. `run_agent_loop` and `run_tool_calls` both use
+`return` inside a generator to hand back "what's still pending" as their
+`StopIteration` value; `main.py`'s `drive_agent_loop` drives them by hand
+with `next()` to capture it, since a plain `for event in loop:` discards
+that. Denying a call doesn't end the conversation - it appends "User denied
+this action" as that tool's result and lets the model react, same as any
+other tool outcome. Verified live end-to-end (approve executes and the loop
+correctly continues into the *next* step, including pausing again on a
+second approval-required call in that continuation; deny correctly skips
+execution and the model adapts) via both direct calls and the real
+`/chat` → `/chat/respond` HTTP round-trip.
 
 ## Running it
 

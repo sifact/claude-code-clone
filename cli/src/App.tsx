@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
-import { streamChat, type AgentEvent } from "./lib/agent-client.js";
+import { respondToApproval, streamChat, type AgentEvent } from "./lib/agent-client.js";
 
 type Mode = "PLAN" | "BUILD";
+
+type PendingApproval = { toolCallId: string; name: string; input: unknown };
 
 type LogEntry =
   | { kind: "user"; id: string; text: string }
@@ -13,6 +15,7 @@ type LogEntry =
   | { kind: "tool_result"; id: string; output: unknown }
   | { kind: "tool_error"; id: string; error: string }
   | { kind: "tool_skipped"; id: string; name: string }
+  | { kind: "tool_denied"; id: string }
   | { kind: "system"; id: string; text: string };
 
 const SESSION_ID = randomUUID();
@@ -34,6 +37,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<Mode>("BUILD");
   const [busy, setBusy] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const streamingIdRef = useRef<string | null>(null);
 
   function appendLog(entry: LogEntry) {
@@ -80,6 +84,18 @@ export default function App() {
       return;
     }
 
+    if (event.type === "approval_required") {
+      streamingIdRef.current = null;
+      appendLog({ kind: "tool_call", id: event.tool_call_id, name: event.name, input: event.input });
+      setPendingApproval({ toolCallId: event.tool_call_id, name: event.name, input: event.input });
+      return;
+    }
+
+    if (event.type === "tool_denied") {
+      appendLog({ kind: "tool_denied", id: `${event.tool_call_id}-denied` });
+      return;
+    }
+
     if (event.type === "done") {
       streamingIdRef.current = null;
       setLog((prev) =>
@@ -108,7 +124,7 @@ export default function App() {
 
   async function handleSubmit(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || busy) return;
+    if (!trimmed || busy || pendingApproval) return;
 
     appendLog({ kind: "user", id: randomUUID(), text: trimmed });
     setInput("");
@@ -128,9 +144,35 @@ export default function App() {
     }
   }
 
-  // No mouse in a terminal, so the mode toggle from the browser version
-  // (a clickable button) becomes a keybinding instead.
-  useInput((_input, key) => {
+  async function resolveApproval(decision: "approve" | "deny") {
+    if (!pendingApproval) return;
+
+    setPendingApproval(null);
+    setBusy(true);
+    streamingIdRef.current = null;
+
+    try {
+      await respondToApproval({ sessionId: SESSION_ID, decision }, handleEvent);
+    } catch (error) {
+      appendLog({
+        kind: "system",
+        id: randomUUID(),
+        text: `error: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // No mouse in a terminal: the mode toggle (a clickable button in the
+  // browser) is a keybinding, and so is the approve/deny prompt.
+  useInput((rawInput, key) => {
+    if (pendingApproval) {
+      const answer = rawInput.toLowerCase();
+      if (answer === "y" || key.return) void resolveApproval("approve");
+      else if (answer === "n" || key.escape) void resolveApproval("deny");
+      return;
+    }
     if (key.tab && !busy) {
       setMode((m) => (m === "BUILD" ? "PLAN" : "BUILD"));
     }
@@ -149,25 +191,35 @@ export default function App() {
         {log.map((entry) => (
           <LogLine key={entry.id} entry={entry} />
         ))}
-        {busy && !streamingIdRef.current && <Text dimColor>…thinking</Text>}
+        {busy && !streamingIdRef.current && !pendingApproval && <Text dimColor>…thinking</Text>}
       </Box>
 
-      <Box marginTop={1}>
-        <Text color="green" bold>
-          {mode === "PLAN" ? "plan" : "build"}{" "}❯{" "}
-        </Text>
-        <TextInput
-          value={input}
-          onChange={setInput}
-          onSubmit={handleSubmit}
-          focus={!busy}
-          placeholder={busy ? "streaming…" : "ask the agent to do something"}
-        />
-      </Box>
-
-      <Box marginTop={1}>
-        <Text dimColor>tab: toggle mode · enter: send · ctrl+c: quit</Text>
-      </Box>
+      {pendingApproval ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="yellow" bold>
+            ⚠ approve {pendingApproval.name} {formatToolInput(pendingApproval.input)}?
+          </Text>
+          <Text dimColor>y / enter: approve · n / esc: deny</Text>
+        </Box>
+      ) : (
+        <>
+          <Box marginTop={1}>
+            <Text color="green" bold>
+              {mode === "PLAN" ? "plan" : "build"}{" "}❯{" "}
+            </Text>
+            <TextInput
+              value={input}
+              onChange={setInput}
+              onSubmit={handleSubmit}
+              focus={!busy}
+              placeholder={busy ? "streaming…" : "ask the agent to do something"}
+            />
+          </Box>
+          <Box marginTop={1}>
+            <Text dimColor>tab: toggle mode · enter: send · ctrl+c: quit</Text>
+          </Box>
+        </>
+      )}
     </Box>
   );
 }
@@ -198,6 +250,8 @@ function LogLine({ entry }: { entry: LogEntry }) {
       return <Text color="red">✕ {entry.error}</Text>;
     case "tool_skipped":
       return <Text dimColor>↻ skipped repeated {entry.name} call (already have this result)</Text>;
+    case "tool_denied":
+      return <Text color="red">✕ denied — not executed</Text>;
     case "system":
       return (
         <Text dimColor italic>
