@@ -10,7 +10,10 @@ in-memory dict). The only thing this project is about is: how does an LLM
 agent loop actually work, end to end.
 
 Runs against **xAI's Grok** (OpenAI-compatible API) as the sole provider.
-Model: `grok-4.6`.
+Model: `grok-build-0.1` — picked after comparing prices across xAI's `/models`
+endpoint (it's the cheapest chat model in the catalog: half `grok-4.6`'s
+prompt cost, a third its completion cost) and confirming live that it still
+supports tool calling correctly.
 
 This went through several earlier versions worth knowing about, since the
 project's history is part of the lesson: it started on Groq alone, then grew

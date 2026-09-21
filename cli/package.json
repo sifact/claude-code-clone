@@ -1,0 +1,20 @@
+{
+  "name": "@nightcode-fastapi/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.tsx"
+  },
+  "dependencies": {
+    "ink": "7.1.1",
+    "ink-text-input": "6.0.0",
+    "react": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/react": "19.2.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

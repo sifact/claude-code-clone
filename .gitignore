@@ -1,5 +1,6 @@
 backend/.env
 backend/workspace/
+cli/node_modules/
 
 .DS_Store
 *.local

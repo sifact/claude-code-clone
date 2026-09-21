@@ -11,5 +11,5 @@ MAX_VALIDATION_RETRIES = 2  # retries after the API rejects the model's own gene
 # 150s: this model can genuinely take 100+ seconds to respond on a normal
 # request, so a tighter timeout would misfire more often than it'd catch a
 # real hang.
-MODEL = os.environ.get("AGENT_MODEL", "grok-4.6")
+MODEL = os.environ.get("AGENT_MODEL", "grok-build-0.1")
 client = OpenAI(base_url="https://api.x.ai/v1", api_key=os.environ.get("XAI_API_KEY"), timeout=150.0)
