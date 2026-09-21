@@ -1,13 +1,24 @@
 # nightcode-fastapi
 
 A from-scratch reimplementation of [nightcode](../nightcode)'s AI agent loop, using
-FastAPI + React instead of Hono + AI SDK, with **no agent framework** — the
-tool-calling loop is hand-written so the mechanics are visible instead of
-hidden behind `streamText()` / `.compile()`.
+FastAPI + React/Ink instead of Hono + AI SDK.
+
+**This branch (`feature/langgraph`) is step 2 of the learning plan**: the
+same agent loop, same tools, same FastAPI endpoints, same frontends -
+rebuilt on LangGraph instead of hand-written. `main` and the earlier
+`feature/*` branches have the hand-rolled version (`agent/loop.py`, a plain
+`for` loop with no framework); this branch replaces `agent/` internals with
+a `StateGraph` while keeping everything *outside* `agent/` - `tools/`,
+`system_prompt.py`, both frontends - completely unchanged. That's what makes
+it a fair comparison rather than a rewrite: same behavior, verified live
+here the same way it was on the hand-rolled branches, different mechanism
+underneath. See "Hand-rolled vs LangGraph" below for what that swap actually
+bought.
 
 Billing, auth, and persistence are intentionally left out (sessions are an
-in-memory dict). The only thing this project is about is: how does an LLM
-agent loop actually work, end to end.
+in-memory dict - or, on this branch, an in-memory checkpointer, same idea).
+The only thing this project is about is: how does an LLM agent loop actually
+work, end to end.
 
 Runs against **xAI's Grok** (OpenAI-compatible API) as the sole provider.
 Model: `grok-build-0.1` — picked after comparing prices across xAI's `/models`
@@ -97,20 +108,43 @@ like in practice, not just in theory:
    previously executed twice more now get caught and skipped, and the model
    moves on to other actions (like actually running the test suite) instead
    of looping.
+7. **Porting `already_called()` to LangGraph's state introduced a fresh bug
+   in the exact same spot** - the first `list_directory` call on a brand new
+   thread got flagged as a duplicate *of itself*. Cause: by the time
+   `run_one_tool` runs, `state["messages"]` already includes the AIMessage
+   that requested the call being checked, so the dedup scan found a
+   "prior" match that was really just itself. The hand-rolled version dodged
+   this with a `prior_messages = messages[:-1]` snapshot taken *before* the
+   assistant message was appended; that exact slice isn't safe here because
+   a multi-tool-call turn can have several `run_one_tool` invocations after
+   one `call_model` call, so `[-1]` isn't reliably "the triggering message."
+   Fixed by identity instead of position: `_next_unanswered_tool_call` now
+   returns the triggering `AIMessage` itself, and the dedup check filters it
+   out by object identity (`m is not triggering_message`) rather than by
+   slicing. Same bug class as #6, different framework, caught the same way -
+   by testing live instead of trusting that the port was equivalent.
 
 ## Architecture
 
 ```
 backend/    FastAPI. POST /chat streams Server-Sent Events.
   app/
-    main.py             FastAPI app, SSE endpoint, in-memory sessions
-    system_prompt.py    PLAN/BUILD mode-conditional prompt
-    agent/              the loop itself — read loop.py first
-      loop.py             run_agent_loop: ask model, run tools, repeat
-      provider.py         model client config (base_url, model, timeout)
-      dedup.py            skips a repeated read-only tool call
-      approval.py         which tools pause for a human decision (CLI only)
-    tools/              tool schemas + sandboxed execution (server-side)
+    main.py             FastAPI app, SSE endpoints - no SESSIONS/PENDING_APPROVALS
+                         dicts on this branch, the checkpointer owns that now
+    system_prompt.py    PLAN/BUILD mode-conditional prompt (unchanged)
+    agent/              the graph itself — read graph.py first
+      graph.py            builds the StateGraph: call_model + run_one_tool
+                           nodes, conditional routing, interrupt()-based
+                           approval, InMemorySaver checkpointer
+      state.py            the graph's state shape (messages, mode, workdir)
+      provider.py          ChatOpenAI client config (same base_url/model as
+                           the hand-rolled version's raw openai client)
+      dedup.py            skips a repeated read-only tool call (same idea as
+                           the hand-rolled version, adapted for BaseMessage)
+      approval.py         which tools pause for a human decision (CLI only,
+                           unchanged - framework-agnostic either way)
+    tools/              tool schemas + sandboxed execution (server-side) -
+                         entirely unchanged from the hand-rolled branches
       schemas.py          the 7 tool definitions the model sees
       dispatch.py         routes a tool call by name to its handler
       filesystem.py       read_file/list_directory/glob/grep/write_file/edit_file
@@ -133,42 +167,40 @@ cli/        A real terminal client via Ink (React renderer for terminals,
 ```
 
 Each backend file is small enough to read start to finish in one sitting.
-`agent/loop.py` is the one file worth reading closely — everything else
+`agent/graph.py` is the one file worth reading closely — everything else
 supports it.
 
 **Tool execution still happens on the server**, not the client — every tool
-call goes through `tools/dispatch.py` regardless of which frontend is
-asking. What changed is *where* it's sandboxed: every request now carries a
-`cwd`, and tools are confined to that directory instead of one fixed folder.
-The browser has no real filesystem to point at, so it omits `cwd` and falls
-back to `DEFAULT_WORKDIR` (`backend/workspace/`, unchanged). The CLI sends
-its own `process.cwd()` — so it operates on whatever real project you
-launched it from, the same experience as nightcode's actual CLI, even though
-the *mechanism* differs (nightcode's CLI executes tools locally because it
-has direct filesystem access; here the server still executes them, now just
-pointed at your real directory instead of a fixed one). `bash` can run real
-commands on your actual machine, which is why `write_file`/`edit_file`/`bash`
-(`agent/approval.py`) now pause for a human decision before running — see
-below.
+call goes through `tools/dispatch.py`, same as the hand-rolled version,
+regardless of which frontend is asking. Sandboxing is still per-request: the
+CLI sends its own `process.cwd()` (`state["workdir"]`), the browser omits it
+and falls back to `DEFAULT_WORKDIR`. None of that changed on this branch -
+it's entirely inside `tools/`, which this branch doesn't touch.
 
-**Human-in-the-loop approval (CLI only).** When the model calls one of the
-three tools above, `agent/loop.py`'s `run_tool_calls` stops *before* running
-it and yields `approval_required` instead — the turn ends there. An SSE
-response can't sit open waiting for a keypress indefinitely, so the
-unresolved tool calls get saved server-side (`PENDING_APPROVALS` in
-`main.py`) and a separate `POST /chat/respond` endpoint applies the decision
-and resumes the loop from exactly that point - same step budget, no
-duplicated model calls. `run_agent_loop` and `run_tool_calls` both use
-`return` inside a generator to hand back "what's still pending" as their
-`StopIteration` value; `main.py`'s `drive_agent_loop` drives them by hand
-with `next()` to capture it, since a plain `for event in loop:` discards
-that. Denying a call doesn't end the conversation - it appends "User denied
-this action" as that tool's result and lets the model react, same as any
-other tool outcome. Verified live end-to-end (approve executes and the loop
-correctly continues into the *next* step, including pausing again on a
-second approval-required call in that continuation; deny correctly skips
-execution and the model adapts) via both direct calls and the real
-`/chat` → `/chat/respond` HTTP round-trip.
+**Human-in-the-loop approval (CLI only) — now via `interrupt()`.** This is
+the part LangGraph actually buys something real for. The hand-rolled version
+needed a hand-built `PENDING_APPROVALS` dict, a second endpoint that
+manually replayed remaining tool calls, and threading a `resume` state
+through `run_agent_loop` to pick back up correctly. Here, `run_one_tool`
+just calls `interrupt({...})` when a tool needs approval (`agent/graph.py`);
+LangGraph's checkpointer persists *everything* - full state, which node was
+running, all of it - the instant that happens, and `POST /chat/respond`
+resumes with nothing more than `agent_graph.stream(Command(resume=decision),
+config)`. No custom state dict, no manual replay logic.
+
+The one thing that isn't free: `interrupt()` re-runs its node **from the
+top** on resume, so any side effect *before* the interrupt call in that same
+node would silently re-execute too. That's why `run_one_tool` handles
+exactly one tool call per invocation - via a graph edge that loops back to
+itself while there's more to do, not a Python `for` loop over all of them -
+so every invocation calls `interrupt()` at most once, before any side
+effect, with nothing earlier in that same call for a resume to replay.
+Verified live end-to-end through the real `/chat` → `/chat/respond` HTTP
+round-trip: approve executes and the graph correctly continues (including
+pausing again on a second approval-required call reached in that
+continuation, and the model persistently trying an *alternative* tool after
+one denial, correctly caught by the same gate again); deny skips execution
+and the model adapts, same as the hand-rolled version.
 
 ## Running it
 
@@ -176,6 +208,8 @@ execution and the model adapts) via both direct calls and the real
 # backend
 cd backend
 cp .env.example .env   # fill in XAI_API_KEY (console.x.ai)
+                        # LANGSMITH_* is optional on this branch - ambient
+                        # env vars, no code changes needed to enable tracing
 uv run uvicorn app.main:app --reload --port 8000
 
 # browser client (separate terminal)
@@ -192,20 +226,47 @@ version. Ask the agent to explore or edit files and watch the raw
 tool-calling loop play out — in `backend/workspace/` for the browser client,
 or wherever you launched `cli/` from for the terminal client.
 
-## What to compare against nightcode
+## Hand-rolled vs LangGraph
 
-| Concept | nightcode | here |
+The direct comparison this branch exists for. "Hand-rolled" means `main` /
+the earlier `feature/*` branches; "LangGraph" is this branch. Same
+behavior, same tests passing, same frontends untouched either way.
+
+| Concept | Hand-rolled | LangGraph |
 |---|---|---|
-| Agent loop | `streamText({ tools })` + `sendAutomaticallyWhen` (AI SDK) | explicit `for` loop in `agent/loop.py`, manually appending tool result messages |
-| Tool execution | client-side (CLI has fs access) | server-side always; sandboxed to the requester's `cwd` (CLI) or `DEFAULT_WORKDIR` (browser) |
-| Mode gating | `getToolContracts(mode)` (shared) + re-checked in `local-tools.ts` | `get_tool_schemas(mode)` + re-checked in `execute_tool` |
-| Model provider | Anthropic/OpenAI via AI SDK's unified interface | xAI/Grok (OpenAI-compatible) via the raw `openai` client |
-| Tool-call wire format | discrete `tool_use` content blocks (Anthropic-style) | incremental JSON fragments keyed by index, reassembled in `agent/loop.py` |
-| Streaming protocol | AI SDK's UIMessage stream | hand-rolled SSE, one JSON event per line |
-| Step limit | implicit (`lastAssistantMessageIsCompleteWithToolCalls` loop) | explicit `MAX_STEPS` in `agent/provider.py` |
+| Loop structure | explicit `for` loop in `agent/loop.py`, manually appending messages | `StateGraph` with two nodes (`call_model`, `run_one_tool`) and conditional edges between them |
+| Turn/session state | `SESSIONS` dict in `main.py`, mutated in place | `InMemorySaver` checkpointer, keyed by `thread_id` (= `session_id`) - `main.py` holds no state at all |
+| Human-in-the-loop pause/resume | `PENDING_APPROVALS` dict + a hand-threaded `resume` param through `run_agent_loop`, `StopIteration.value` to hand back what's pending | `interrupt()` + `Command(resume=...)` - the checkpointer persists everything automatically |
+| Tool-call wire format handling | manual: reassemble incremental JSON-string fragments keyed by index (`agent/loop.py`) | handled by `langchain-openai`'s `ChatOpenAI` - never touched directly |
+| Retry on a rejected generation | explicit `attempt` loop + `isinstance(error, APIConnectionError)` branch | same explicit logic, same exception types (LangChain's wrapped errors multiply-inherit from `openai`'s own hierarchy - `except APIError` needed no changes) |
+| Step budget | `MAX_STEPS`, a plain loop counter | `recursion_limit` on `graph.stream()` - counts graph steps, not turns, so it's not a 1:1 mapping |
+| Token-level streaming | native - the raw `openai` client's `.stream()` | `llm.stream()` inside `call_model`, pushed out via `get_stream_writer()` on LangGraph's `"custom"` channel |
+| Tracing | none built in | `LANGSMITH_TRACING=true` + an API key - zero code changes, purely ambient |
+
+**What genuinely got simpler**: the entire human-in-the-loop mechanism.
+`PENDING_APPROVALS`, the manual "apply the decision to the first pending
+item, then continue the rest" logic, threading `resume` through the outer
+step loop - all of that was custom-built to work around one constraint (an
+SSE response can't wait for a keypress). `interrupt()` + a checkpointer
+solves the identical constraint natively, and does it more capably (full
+state, not just a hand-picked slice of it).
+
+**What didn't get simpler, or even got a little more subtle**: multi-tool-
+call turns. The hand-rolled version could safely loop over every tool call
+in a Python `for` loop. Here, that same loop had to move to the *graph*
+level (`run_one_tool` looping back to itself via an edge) specifically
+because of how `interrupt()` replays a node on resume - a real constraint
+the framework introduces that the hand-rolled version never had to think
+about, because it never had this pause/resume superpower to begin with.
+
+**What's most telling**: the exact same bug (a dedup check matching itself
+because it ran too late relative to when the triggering message got
+appended) showed up in *both* implementations, independently, at the same
+point. Same root cause, different framework - the mechanics don't get
+safer just because a framework is doing more of the surrounding work.
 
 ## Next steps (per the learning plan)
 
-1. **This repo** — raw loop, no framework. ← you are here
-2. Rebuild the same thing in LangGraph, with LangSmith tracing.
+1. Raw loop, no framework — the hand-rolled branches (`main` and the earlier `feature/*`).
+2. **This branch** — the same thing rebuilt on LangGraph, with LangSmith tracing. ← you are here
 3. A pass through Semantic Kernel/AutoGen (Microsoft's own agent stack).

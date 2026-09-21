@@ -1,7 +1,7 @@
 [project]
 name = "nightcode-fastapi"
 version = "0.1.0"
-description = "Hand-rolled tool-calling agent loop over FastAPI, no agent framework"
+description = "FastAPI agent loop rebuilt on LangGraph, for direct comparison against the hand-rolled version"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -9,4 +9,7 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "openai>=1.54",
     "python-dotenv>=1.0",
+    "langgraph>=1.2.11",
+    "langchain-openai>=1.6.2",
+    "langsmith>=0.13.0",
 ]

@@ -1,9 +1,9 @@
 """FastAPI entrypoint. Two endpoints: POST /chat starts a turn, POST
-/chat/respond continues one that paused for a human approval decision.
+/chat/respond continues one paused on a human approval decision.
 
-Sessions are an in-memory dict (list of OpenAI-format chat messages per
-session id) - no database. That's a deliberate simplification to keep this
-phase focused on the agent loop itself, not persistence.
+No SESSIONS or PENDING_APPROVALS dict here, unlike the hand-rolled version -
+the LangGraph checkpointer owns all of that now, keyed by `session_id` as
+its `thread_id`. That's the whole comparison this branch exists to show.
 """
 
 import json
@@ -15,12 +15,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import BaseMessage
+from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 from pydantic import BaseModel
 
 load_dotenv()
 
-from .agent import run_agent_loop  # noqa: E402
-from .tools import DEFAULT_WORKDIR, ToolError, execute_tool  # noqa: E402
+from .agent import RECURSION_LIMIT, agent_graph, initial_input  # noqa: E402
+from .tools import DEFAULT_WORKDIR  # noqa: E402
 
 app = FastAPI(title="nightcode-fastapi")
 
@@ -30,12 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-SESSIONS: dict[str, list[dict]] = {}
-# session_id -> {"tool_calls": [...], "step": int, "prior_len": int, "mode": str, "workdir": str}
-# Present only while a step is paused waiting on a write_file/edit_file/bash
-# approval - see agent/loop.py's run_tool_calls for what each field means.
-PENDING_APPROVALS: dict[str, dict[str, Any]] = {}
 
 
 class ChatRequest(BaseModel):
@@ -64,102 +61,79 @@ def resolve_workdir(cwd: str | None) -> Path:
     return workdir
 
 
-def drive_agent_loop(
-    loop: Generator[dict[str, Any], None, dict[str, Any] | None],
-    session_id: str,
-    mode: str,
-    workdir: Path,
-) -> Generator[str, None, None]:
-    """Formats a run_agent_loop generator's events as SSE lines, and records
-    (or clears) PENDING_APPROVALS based on what it returns when it finishes.
+def has_pending_approval(config: dict[str, Any]) -> bool:
+    # A non-empty `.next` means the graph stopped mid-run - the only way
+    # that happens here is an unresolved interrupt() in run_one_tool.
+    return bool(agent_graph.get_state(config).next)
 
-    A plain `for event in loop:` can't see that return value - Python
-    discards it - so this drives the generator by hand with next()/
-    StopIteration instead, the same thing a for-loop does under the hood.
+
+def sse_events(step_input: Any, config: dict[str, Any]) -> Generator[str, None, None]:
+    """Drives the graph and formats its "custom" events (our own event
+    vocabulary, emitted via get_stream_writer() in graph.py) as SSE lines.
+    Interrupts don't come through that channel - they're a distinct
+    LangGraph control-flow signal - so they're translated here instead.
+
+    Both frontends expect a final `done` event to clear their streaming
+    cursor - the graph itself doesn't emit one (it just stops), so this
+    adds it explicitly, except when the turn paused on an approval instead
+    (that already clears the cursor client-side on `approval_required`).
     """
-
-    while True:
-        try:
-            event = next(loop)
-        except StopIteration as stop:
-            pending = stop.value
-            if pending is not None:
-                PENDING_APPROVALS[session_id] = {**pending, "mode": mode, "workdir": str(workdir)}
-            else:
-                PENDING_APPROVALS.pop(session_id, None)
-            return
-        yield f"data: {json.dumps(event)}\n\n"
-
-
-def sse_stream(session_id: str, mode: str, workdir: Path) -> Generator[str, None, None]:
-    history = SESSIONS[session_id]
-
+    interrupted = False
     try:
-        yield from drive_agent_loop(run_agent_loop(history, mode, workdir), session_id, mode, workdir)
+        for mode, chunk in agent_graph.stream(
+            step_input, config, stream_mode=["custom", "updates"], recursion_limit=RECURSION_LIMIT
+        ):
+            if mode == "custom":
+                yield f"data: {json.dumps(chunk)}\n\n"
+            elif mode == "updates" and "__interrupt__" in chunk:
+                interrupted = True
+                approval = {"type": "approval_required", **chunk["__interrupt__"][0].value}
+                yield f"data: {json.dumps(approval)}\n\n"
+        if not interrupted:
+            yield f"data: {json.dumps({'type': 'done', 'stop_reason': 'stop'})}\n\n"
+    except GraphRecursionError:
+        yield f"data: {json.dumps({'type': 'done', 'stop_reason': 'max_steps_exceeded'})}\n\n"
     except Exception as error:  # noqa: BLE001 - last line of defense so the
         # SSE stream always terminates with an event the client can render,
         # instead of dying mid-response and leaving the frontend hanging.
-        print(f"Unhandled error in agent loop: {error}")
-        yield f"data: {json.dumps({'type': 'error', 'message': str(error)})}\n\n"
-
-
-def respond_stream(session_id: str, decision: Literal["approve", "deny"]) -> Generator[str, None, None]:
-    pending = PENDING_APPROVALS.get(session_id)
-    if pending is None:
-        yield f"data: {json.dumps({'type': 'error', 'message': 'No pending approval for this session'})}\n\n"
-        return
-
-    history = SESSIONS[session_id]
-    mode = pending["mode"]
-    workdir = Path(pending["workdir"])
-    tc, *rest = pending["tool_calls"]
-    tool_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
-
-    try:
-        if decision == "approve":
-            output = execute_tool(tc["name"], tool_input, mode, workdir)
-            history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(output)})
-            yield f"data: {json.dumps({'type': 'tool_result', 'tool_call_id': tc['id'], 'output': output})}\n\n"
-        else:
-            history.append(
-                {"role": "tool", "tool_call_id": tc["id"], "content": "User denied this action; it was not run."}
-            )
-            yield f"data: {json.dumps({'type': 'tool_denied', 'tool_call_id': tc['id']})}\n\n"
-    except ToolError as error:
-        history.append({"role": "tool", "tool_call_id": tc["id"], "content": f"error: {error}"})
-        yield f"data: {json.dumps({'type': 'tool_error', 'tool_call_id': tc['id'], 'error': str(error)})}\n\n"
-
-    resume_state = {"tool_calls": rest, "step": pending["step"], "prior_len": pending["prior_len"]}
-
-    try:
-        loop = run_agent_loop(history, mode, workdir, resume=resume_state)
-        yield from drive_agent_loop(loop, session_id, mode, workdir)
-    except Exception as error:  # noqa: BLE001
-        print(f"Unhandled error resuming agent loop: {error}")
+        # (call_model already emits a `error` custom event before raising,
+        # for a clean model/API failure - this also catches anything else.)
+        print(f"Unhandled error in agent graph: {error}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(error)})}\n\n"
 
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    if req.session_id in PENDING_APPROVALS:
+    config = {"configurable": {"thread_id": req.session_id}}
+    if has_pending_approval(config):
         raise HTTPException(409, "Resolve the pending tool approval (/chat/respond) before sending a new message")
 
     workdir = resolve_workdir(req.cwd)
+    step_input = initial_input(req.message, req.mode, workdir)
 
-    history = SESSIONS.setdefault(req.session_id, [])
-    history.append({"role": "user", "content": req.message})
-
-    return StreamingResponse(sse_stream(req.session_id, req.mode, workdir), media_type="text/event-stream")
+    return StreamingResponse(sse_events(step_input, config), media_type="text/event-stream")
 
 
 @app.post("/chat/respond")
 def respond(req: RespondRequest):
-    if req.session_id not in PENDING_APPROVALS:
+    config = {"configurable": {"thread_id": req.session_id}}
+    if not has_pending_approval(config):
         raise HTTPException(404, "No pending approval for this session")
 
-    return StreamingResponse(respond_stream(req.session_id, req.decision), media_type="text/event-stream")
+    return StreamingResponse(sse_events(Command(resume=req.decision), config), media_type="text/event-stream")
+
+
+def _serialize_message(message: BaseMessage) -> dict[str, Any]:
+    return {
+        "role": message.type,
+        "content": message.content,
+        **({"tool_calls": message.tool_calls} if getattr(message, "tool_calls", None) else {}),
+        **({"tool_call_id": message.tool_call_id} if hasattr(message, "tool_call_id") else {}),
+    }
 
 
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
-    return {"messages": SESSIONS.get(session_id, [])}
+    config = {"configurable": {"thread_id": session_id}}
+    messages = agent_graph.get_state(config).values.get("messages", [])
+    return {"messages": [_serialize_message(m) for m in messages]}
