@@ -1,0 +1,147 @@
+.terminal {
+  width: min(920px, 100%);
+  height: min(680px, 92svh);
+  margin: 24px auto;
+  display: flex;
+  flex-direction: column;
+  background: #0c0d10;
+  border: 1px solid #26282f;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.terminal-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #17181d;
+  border-bottom: 1px solid #26282f;
+}
+
+.terminal-dots {
+  display: flex;
+  gap: 6px;
+}
+
+.dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+}
+.dot-red { background: #ff5f57; }
+.dot-yellow { background: #febc2e; }
+.dot-green { background: #28c840; }
+
+.terminal-title {
+  color: #6b6f7a;
+  font-size: 12px;
+  flex: 1;
+  text-align: center;
+}
+
+.mode-toggle {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border: 1px solid #2e313c;
+  background: #1c1e24;
+  color: #9ca3af;
+  border-radius: 5px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.mode-toggle:hover { border-color: #3a3d4a; }
+.mode-toggle.mode-plan { color: #7dd3fc; }
+.mode-toggle.mode-build { color: #86efac; }
+
+.terminal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.line-user {
+  color: #e5e7eb;
+}
+.prompt-inline {
+  color: #86efac;
+}
+
+.line-assistant {
+  color: #d1d5db;
+}
+
+.line-tool-call {
+  color: #fbbf24;
+}
+.line-tool-result {
+  color: #7dd3fc;
+  padding-left: 14px;
+}
+.line-tool-error {
+  color: #f87171;
+}
+.line-system {
+  color: #6b7280;
+  font-style: italic;
+}
+.dim {
+  color: #8b8fa3;
+}
+
+.cursor {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  background: #d1d5db;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s steps(1) infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+.terminal-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid #26282f;
+  background: #101116;
+}
+
+.prompt {
+  color: #86efac;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.terminal-input-row input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #e5e7eb;
+  font: inherit;
+}
+
+.terminal-input-row input::placeholder {
+  color: #4b4f5a;
+}
+
+.terminal-input-row input:disabled {
+  color: #6b7280;
+}

@@ -1,0 +1,20 @@
+:root {
+  color-scheme: dark;
+  font: 14px/1.5 "SF Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #05060a;
+  min-height: 100svh;
+}
+
+#root {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+}

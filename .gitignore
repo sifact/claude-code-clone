@@ -1,0 +1,5 @@
+backend/.env
+backend/workspace/
+
+.DS_Store
+*.local
