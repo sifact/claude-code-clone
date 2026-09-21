@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 from openai import APIConnectionError, APIError
@@ -23,9 +24,12 @@ from .provider import MAX_STEPS, MAX_TOKENS, MAX_VALIDATION_RETRIES, MODEL, clie
 def run_agent_loop(
     history: list[dict[str, Any]],
     mode: str,
+    workdir: Path,
 ) -> Generator[dict[str, Any], None, None]:
     """Yields SSE-ready event dicts. Mutates `history` in place as the
-    session's message list grows across turns.
+    session's message list grows across turns. `workdir` is the sandbox root
+    every tool call is confined to - DEFAULT_WORKDIR for the browser client,
+    or the CLI's own process.cwd() for the terminal client.
     """
 
     messages = history
@@ -151,7 +155,7 @@ def run_agent_loop(
                 continue
 
             try:
-                output = execute_tool(tc["name"], tool_input, mode)
+                output = execute_tool(tc["name"], tool_input, mode, workdir)
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(output)})
                 yield {"type": "tool_result", "tool_call_id": tc["id"], "output": output}
             except ToolError as error:

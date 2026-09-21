@@ -1,9 +1,10 @@
 // Talks to the FastAPI /chat SSE endpoint. Hand-rolled: fetch + a
 // ReadableStream reader, no EventSource (it can't send POST bodies) and no
-// SDK wrapping the protocol - identical to the browser client in
-// frontend/src/lib/agent-client.ts. Node's native fetch (18+) implements the
-// same WHATWG ReadableStream interface a browser does, so this code needed
-// zero changes to run outside a browser.
+// SDK wrapping the protocol - nearly identical to the browser client in
+// frontend/src/lib/agent-client.ts (Node's native fetch implements the same
+// WHATWG ReadableStream interface a browser does). The one real difference:
+// this sends `cwd`, since unlike a browser, this process has an actual
+// filesystem location the backend can sandbox tool calls to.
 
 export type AgentEvent =
   | { type: "text_delta"; text: string }
@@ -18,7 +19,7 @@ export type AgentEvent =
 const API_URL = "http://localhost:8000";
 
 export async function streamChat(
-  params: { sessionId: string; message: string; mode: "PLAN" | "BUILD" },
+  params: { sessionId: string; message: string; mode: "PLAN" | "BUILD"; cwd: string },
   onEvent: (event: AgentEvent) => void,
 ) {
   const response = await fetch(`${API_URL}/chat`, {
@@ -28,6 +29,7 @@ export async function streamChat(
       session_id: params.sessionId,
       message: params.message,
       mode: params.mode,
+      cwd: params.cwd,
     }),
   });
 

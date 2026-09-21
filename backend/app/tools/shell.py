@@ -2,17 +2,18 @@
 
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
-from .sandbox import DEFAULT_TIMEOUT, MAX_OUTPUT, WORKDIR, truncate
+from .sandbox import DEFAULT_TIMEOUT, MAX_OUTPUT, truncate
 
 
-def bash(tool_input: dict[str, Any]) -> dict[str, Any]:
+def bash(tool_input: dict[str, Any], workdir: Path) -> dict[str, Any]:
     timeout = tool_input.get("timeout", DEFAULT_TIMEOUT)
     try:
         proc = subprocess.run(
             ["bash", "-c", tool_input["command"]],
-            cwd=WORKDIR,
+            cwd=workdir,
             capture_output=True,
             text=True,
             timeout=timeout,

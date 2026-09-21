@@ -122,16 +122,33 @@ frontend/   React + Vite, styled as a terminal (dark, monospace, prompt-style
     lib/agent-client.ts  fetch + ReadableStream SSE parsing (no EventSource,
                           it can't send POST bodies)
     App.tsx              terminal UI + event handling
+
+cli/        A real terminal client via Ink (React renderer for terminals,
+            same idea as nightcode's own OpenTUI) instead of a browser.
+  src/
+    lib/agent-client.ts  same SSE client as the browser's, plus `cwd`
+    App.tsx              Ink UI: Box/Text instead of div/CSS, Tab to
+                          toggle mode instead of a clickable button
 ```
 
 Each backend file is small enough to read start to finish in one sitting.
 `agent/loop.py` is the one file worth reading closely — everything else
 supports it.
 
-Tool execution lives on the **server**, not the client — unlike nightcode's
-CLI, which executes tools locally because it has real filesystem access to
-your terminal session. A browser can't touch a filesystem, so tools here run
-sandboxed to `backend/workspace/`.
+**Tool execution still happens on the server**, not the client — every tool
+call goes through `tools/dispatch.py` regardless of which frontend is
+asking. What changed is *where* it's sandboxed: every request now carries a
+`cwd`, and tools are confined to that directory instead of one fixed folder.
+The browser has no real filesystem to point at, so it omits `cwd` and falls
+back to `DEFAULT_WORKDIR` (`backend/workspace/`, unchanged). The CLI sends
+its own `process.cwd()` — so it operates on whatever real project you
+launched it from, the same experience as nightcode's actual CLI, even though
+the *mechanism* differs (nightcode's CLI executes tools locally because it
+has direct filesystem access; here the server still executes them, now just
+pointed at your real directory instead of a fixed one). Worth knowing: this
+means `bash` can run real commands on your actual machine, with **no
+approval gate** before it does — a deliberate scope decision, not an
+oversight, and worth adding if this project outgrows "just for learning."
 
 ## Running it
 
@@ -141,21 +158,26 @@ cd backend
 cp .env.example .env   # fill in XAI_API_KEY (console.x.ai)
 uv run uvicorn app.main:app --reload --port 8000
 
-# frontend (separate terminal)
+# browser client (separate terminal)
 cd frontend
+npm run dev
+
+# or the terminal client instead (separate terminal, from wherever you want it to operate)
+cd cli
 npm run dev
 ```
 
-Open the Vite dev URL (usually `http://localhost:5173`). Ask the agent to
-explore or edit files in `backend/workspace/` and watch the raw tool-calling
-loop play out.
+Open the Vite dev URL (usually `http://localhost:5173`) for the browser
+version. Ask the agent to explore or edit files and watch the raw
+tool-calling loop play out — in `backend/workspace/` for the browser client,
+or wherever you launched `cli/` from for the terminal client.
 
 ## What to compare against nightcode
 
 | Concept | nightcode | here |
 |---|---|---|
 | Agent loop | `streamText({ tools })` + `sendAutomaticallyWhen` (AI SDK) | explicit `for` loop in `agent/loop.py`, manually appending tool result messages |
-| Tool execution | client-side (CLI has fs access) | server-side, sandboxed to `workspace/` |
+| Tool execution | client-side (CLI has fs access) | server-side always; sandboxed to the requester's `cwd` (CLI) or `DEFAULT_WORKDIR` (browser) |
 | Mode gating | `getToolContracts(mode)` (shared) + re-checked in `local-tools.ts` | `get_tool_schemas(mode)` + re-checked in `execute_tool` |
 | Model provider | Anthropic/OpenAI via AI SDK's unified interface | xAI/Grok (OpenAI-compatible) via the raw `openai` client |
 | Tool-call wire format | discrete `tool_use` content blocks (Anthropic-style) | incremental JSON fragments keyed by index, reassembled in `agent/loop.py` |

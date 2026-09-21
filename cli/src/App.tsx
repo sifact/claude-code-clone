@@ -29,6 +29,7 @@ function formatToolOutput(output: unknown) {
 export default function App() {
   const [log, setLog] = useState<LogEntry[]>([
     { kind: "system", id: "boot", text: "nightcode-fastapi -- hand-rolled agent loop, no framework" },
+    { kind: "system", id: "boot-cwd", text: `operating in ${process.cwd()} -- tools run for real here` },
   ]);
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<Mode>("BUILD");
@@ -115,7 +116,7 @@ export default function App() {
     streamingIdRef.current = null;
 
     try {
-      await streamChat({ sessionId: SESSION_ID, message: trimmed, mode }, handleEvent);
+      await streamChat({ sessionId: SESSION_ID, message: trimmed, mode, cwd: process.cwd() }, handleEvent);
     } catch (error) {
       appendLog({
         kind: "system",
